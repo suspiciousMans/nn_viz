@@ -1,0 +1,6 @@
+target/
+spike/
+*.png
+*.log
+*.bak
+main_pre_refactor*

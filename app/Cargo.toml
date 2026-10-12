@@ -1,0 +1,13 @@
+[package]
+name = "nn_viz"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+engine = { path = "C:/Users/james/jame-engine/engine" }
+nn_core = { path = "../core" }
+glam = "0.26"
+log = "0.4"
+env_logger = "0.11"
+anyhow = "1.0"
+image = { version = "0.25", default-features = false, features = ["png"] }
