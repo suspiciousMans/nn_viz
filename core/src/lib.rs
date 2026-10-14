@@ -108,7 +108,8 @@ impl Mlp {
         (dws, dbs)
     }
 
-    pub fn sgd_step(&mut self, batch: &[(Vec<f64>, f64)], lr: f64) -> f64 {
+    /// Mean gradient over the batch, plus the mean loss: (dW per layer, dB per layer, loss).
+    fn batch_grads(&self, batch: &[(Vec<f64>, f64)]) -> (Vec<Vec<f64>>, Vec<Vec<f64>>, f64) {
         let n = batch.len() as f64;
         let mut loss = 0.0;
         let mut gw: Vec<Vec<f64>> = self.layers.iter().map(|l| vec![0.0; l.w.len()]).collect();
@@ -121,11 +122,69 @@ impl Mlp {
                 for j in 0..gb[k].len() { gb[k][j] += db[k][j] / n; }
             }
         }
+        (gw, gb, loss / n)
+    }
+
+    /// One full-batch gradient-descent step. Returns the mean loss before the update.
+    pub fn sgd_step(&mut self, batch: &[(Vec<f64>, f64)], lr: f64) -> f64 {
+        let (gw, gb, loss) = self.batch_grads(batch);
         for k in 0..self.layers.len() {
             for j in 0..self.layers[k].w.len() { self.layers[k].w[j] -= lr * gw[k][j]; }
             for j in 0..self.layers[k].b.len() { self.layers[k].b[j] -= lr * gb[k][j]; }
         }
-        loss / n
+        loss
+    }
+
+    /// One full-batch Adam step (beta1 0.9, beta2 0.999). Returns the mean loss before the update.
+    pub fn adam_step(&mut self, batch: &[(Vec<f64>, f64)], st: &mut AdamState, lr: f64) -> f64 {
+        let (gw, gb, loss) = self.batch_grads(batch);
+        st.t += 1;
+        let c1 = 1.0 - 0.9f64.powi(st.t as i32);
+        let c2 = 1.0 - 0.999f64.powi(st.t as i32);
+        for k in 0..self.layers.len() {
+            adam_update(&mut self.layers[k].w, &gw[k], &mut st.mw[k], &mut st.vw[k], lr, c1, c2);
+            adam_update(&mut self.layers[k].b, &gb[k], &mut st.mb[k], &mut st.vb[k], lr, c1, c2);
+        }
+        loss
+    }
+}
+
+fn adam_update(p: &mut [f64], g: &[f64], m: &mut [f64], v: &mut [f64], lr: f64, c1: f64, c2: f64) {
+    for j in 0..p.len() {
+        m[j] = 0.9 * m[j] + 0.1 * g[j];
+        v[j] = 0.999 * v[j] + 0.001 * g[j] * g[j];
+        p[j] -= lr * (m[j] / c1) / ((v[j] / c2).sqrt() + 1e-8);
+    }
+}
+
+/// Running moment estimates for Adam. Must be rebuilt whenever the network is.
+#[derive(Clone, Debug)]
+pub struct AdamState {
+    mw: Vec<Vec<f64>>,
+    mb: Vec<Vec<f64>>,
+    vw: Vec<Vec<f64>>,
+    vb: Vec<Vec<f64>>,
+    t: u64,
+}
+
+impl AdamState {
+    pub fn new(net: &Mlp) -> Self {
+        let w: Vec<Vec<f64>> = net.layers.iter().map(|l| vec![0.0; l.w.len()]).collect();
+        let b: Vec<Vec<f64>> = net.layers.iter().map(|l| vec![0.0; l.b.len()]).collect();
+        AdamState { mw: w.clone(), vw: w, mb: b.clone(), vb: b, t: 0 }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Optimizer { Sgd, Adam }
+
+impl Optimizer {
+    pub fn name(self) -> &'static str {
+        match self { Optimizer::Sgd => "SGD", Optimizer::Adam => "Adam" }
+    }
+    /// A learning rate that works well for this optimizer on the built-in datasets.
+    pub fn default_lr(self) -> f64 {
+        match self { Optimizer::Sgd => 0.5, Optimizer::Adam => 0.03 }
     }
 }
 
@@ -277,5 +336,18 @@ mod tests {
         for l in &net.layers {
             assert!(l.w.iter().chain(l.b.iter()).all(|v| v.is_finite()));
         }
+    }
+
+    #[test]
+    fn adam_fits_spiral_far_faster_than_sgd() {
+        let data = Dataset::Spiral.points(7, 100);
+        let acc = |net: &Mlp| data.iter().filter(|(x, y)| ((net.predict(x)[0] > 0.5) as i32 as f64) == *y).count() as f64 / data.len() as f64;
+        let mut net = Mlp::new(&[2, 8, 1], &mut Rng::new(42));
+        let mut st = AdamState::new(&net);
+        for _ in 0..3000 { net.adam_step(&data, &mut st, Optimizer::Adam.default_lr()); }
+        assert!(acc(&net) > 0.95, "adam reached only {}", acc(&net));
+        let mut sgd = Mlp::new(&[2, 8, 1], &mut Rng::new(42));
+        for _ in 0..3000 { sgd.sgd_step(&data, Optimizer::Sgd.default_lr()); }
+        assert!(acc(&sgd) < 0.8, "sgd unexpectedly reached {}", acc(&sgd));
     }
 }

@@ -3,7 +3,7 @@ use engine::app::{App, Context, Game};
 use engine::sdl2::event::Event;
 use engine::ui::EguiState;
 use engine::ui::egui;
-use nn_core::{Dataset, Mlp, Rng};
+use nn_core::{AdamState, Dataset, Mlp, Optimizer, Rng};
 
 const GRID: usize = 48;
 /// Plot domain per dataset. XOR lives in [0,1]^2; circles and spiral live in [-1,1]^2.
@@ -20,6 +20,8 @@ struct NnViz {
     net: Mlp,
     dataset: Dataset,
     hidden: usize,
+    optimizer: Optimizer,
+    adam: AdamState,
     data: Vec<(Vec<f64>, f64)>,
     lr: f64,
     steps_per_frame: usize,
@@ -88,6 +90,7 @@ struct Controls {
     sel: usize,
     dataset: Dataset,
     hidden: usize,
+    optimizer: Optimizer,
 }
 
 /// Read-only numbers the sidebar displays.
@@ -107,6 +110,7 @@ struct Actions {
     reset_rect: Option<egui::Rect>,
     dataset_rects: Vec<(Dataset, egui::Rect)>,
     hidden_rects: Vec<(usize, egui::Rect)>,
+    optimizer_rects: Vec<(Optimizer, egui::Rect)>,
     lr_rect: Option<egui::Rect>,
     paused_rect: Option<egui::Rect>,
     sel_rect: Option<egui::Rect>,
@@ -135,6 +139,17 @@ fn sidebar(ui: &mut egui::Ui, ctl: &mut Controls, info: &SidebarInfo) -> Actions
             let r = ui.selectable_label(ctl.hidden == h, format!("{h}"));
             a.hidden_rects.push((h, r.rect));
             if r.clicked() { ctl.hidden = h; }
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("optimizer:");
+        for opt in [Optimizer::Sgd, Optimizer::Adam] {
+            let r = ui.selectable_label(ctl.optimizer == opt, opt.name());
+            a.optimizer_rects.push((opt, r.rect));
+            if r.clicked() && ctl.optimizer != opt {
+                ctl.optimizer = opt;
+                ctl.lr = opt.default_lr();
+            }
         }
     });
     let step_resp = ui.button("step (x1)");
@@ -168,8 +183,10 @@ impl NnViz {
             net: fresh_net(env_hidden()),
             dataset: env_dataset(),
             hidden: env_hidden(),
+            optimizer: Optimizer::Adam,
+            adam: AdamState::new(&fresh_net(env_hidden())),
             data: env_dataset().points(DATA_SEED, PER_CLASS),
-            lr: 0.5,
+            lr: Optimizer::Adam.default_lr(),
             steps_per_frame: 20,
             step: 0,
             paused: false,
@@ -185,9 +202,10 @@ impl NnViz {
     /// Applies one frame's clicks and control changes. Order matches the pre-refactor code:
     /// rebuild on dataset/hidden change, then reset, then a single manual step.
     fn apply(&mut self, ctl: &Controls, a: &Actions) {
-        let arch_changed = ctl.hidden != self.hidden || ctl.dataset != self.dataset;
+        let arch_changed = ctl.hidden != self.hidden || ctl.dataset != self.dataset || ctl.optimizer != self.optimizer;
         self.dataset = ctl.dataset;
         self.hidden = ctl.hidden;
+        self.optimizer = ctl.optimizer;
         if arch_changed {
             self.rebuild();
         }
@@ -202,6 +220,7 @@ impl NnViz {
 
     fn reset(&mut self) {
         self.net = fresh_net(self.hidden);
+        self.adam = AdamState::new(&self.net);
         self.step = 0;
         self.loss_hist.clear();
         self.loss = f64::NAN;
@@ -212,6 +231,7 @@ impl NnViz {
     fn rebuild(&mut self) {
         self.data = self.dataset.points(DATA_SEED, PER_CLASS);
         self.net = fresh_net(self.hidden);
+        self.adam = AdamState::new(&self.net);
         self.sel = 0;
         self.step = 0;
         self.loss_hist.clear();
@@ -221,7 +241,10 @@ impl NnViz {
 
     fn train(&mut self, n: usize) {
         for _ in 0..n {
-            self.loss = self.net.sgd_step(&self.data, self.lr);
+            self.loss = match self.optimizer {
+                Optimizer::Sgd => self.net.sgd_step(&self.data, self.lr),
+                Optimizer::Adam => self.net.adam_step(&self.data, &mut self.adam, self.lr),
+            };
             self.step += 1;
             if self.step % 10 == 0 {
                 self.loss_hist.push(self.loss);
@@ -281,6 +304,7 @@ impl Game for NnViz {
             sel: self.sel,
             dataset: self.dataset,
             hidden: self.hidden,
+            optimizer: self.optimizer,
         };
         let hist = self.loss_hist.clone();
         let grid = self.grid.clone();
@@ -479,7 +503,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut a = app(Dataset::Circles, 4);
         a.train(30);
-        let mut ctl = Controls { paused: false, lr: a.lr, sel: 0, dataset: a.dataset, hidden: a.hidden };
+        let mut ctl = Controls { paused: false, lr: a.lr, sel: 0, dataset: a.dataset, hidden: a.hidden, optimizer: a.optimizer };
         let info = info_for(&a);
         let first = layout(&ctx, &mut ctl, &info);
         let pos = first.reset_rect.expect("reset button laid out").center();
@@ -496,7 +520,7 @@ mod tests {
     fn real_click_on_step_advances_one_iteration() {
         let ctx = egui::Context::default();
         let mut a = app(Dataset::Xor, 4);
-        let mut ctl = Controls { paused: true, lr: a.lr, sel: 0, dataset: a.dataset, hidden: a.hidden };
+        let mut ctl = Controls { paused: true, lr: a.lr, sel: 0, dataset: a.dataset, hidden: a.hidden, optimizer: a.optimizer };
         let info = info_for(&a);
         let first = layout(&ctx, &mut ctl, &info);
         let pos = first.step_rect.expect("step button laid out").center();
@@ -510,7 +534,7 @@ mod tests {
     fn real_click_on_dataset_toggle_rebuilds() {
         let ctx = egui::Context::default();
         let mut a = app(Dataset::Xor, 4);
-        let mut ctl = Controls { paused: false, lr: a.lr, sel: 0, dataset: a.dataset, hidden: a.hidden };
+        let mut ctl = Controls { paused: false, lr: a.lr, sel: 0, dataset: a.dataset, hidden: a.hidden, optimizer: a.optimizer };
         let info = info_for(&a);
         let first = layout(&ctx, &mut ctl, &info);
         let (_, rect) = *first.dataset_rects.iter().find(|(d, _)| *d == Dataset::Spiral).expect("spiral toggle laid out");
@@ -525,7 +549,7 @@ mod tests {
     fn real_click_on_hidden_toggle_rebuilds_network() {
         let ctx = egui::Context::default();
         let mut a = app(Dataset::Circles, 4);
-        let mut ctl = Controls { paused: false, lr: a.lr, sel: 0, dataset: a.dataset, hidden: a.hidden };
+        let mut ctl = Controls { paused: false, lr: a.lr, sel: 0, dataset: a.dataset, hidden: a.hidden, optimizer: a.optimizer };
         let info = info_for(&a);
         let first = layout(&ctx, &mut ctl, &info);
         let (_, rect) = *first.hidden_rects.iter().find(|(h, _)| *h == 8).expect("hidden=8 toggle laid out");
@@ -541,7 +565,7 @@ mod tests {
     fn real_click_on_paused_checkbox_toggles_it() {
         let ctx = egui::Context::default();
         let a = app(Dataset::Xor, 4);
-        let mut ctl = Controls { paused: false, lr: a.lr, sel: 0, dataset: a.dataset, hidden: a.hidden };
+        let mut ctl = Controls { paused: false, lr: a.lr, sel: 0, dataset: a.dataset, hidden: a.hidden, optimizer: a.optimizer };
         let info = info_for(&a);
         let first = layout(&ctx, &mut ctl, &info);
         let pos = first.paused_rect.expect("paused checkbox laid out").center();
@@ -553,7 +577,7 @@ mod tests {
     fn real_click_on_lr_slider_changes_learning_rate() {
         let ctx = egui::Context::default();
         let a = app(Dataset::Xor, 4);
-        let mut ctl = Controls { paused: false, lr: a.lr, sel: 0, dataset: a.dataset, hidden: a.hidden };
+        let mut ctl = Controls { paused: false, lr: a.lr, sel: 0, dataset: a.dataset, hidden: a.hidden, optimizer: a.optimizer };
         let before = ctl.lr;
         let info = info_for(&a);
         let first = layout(&ctx, &mut ctl, &info);
@@ -570,13 +594,39 @@ mod tests {
         let ctx = egui::Context::default();
         let mut a = app(Dataset::Circles, 4);
         a.train(10);
-        let mut ctl = Controls { paused: false, lr: a.lr, sel: 150, dataset: a.dataset, hidden: a.hidden };
+        let mut ctl = Controls { paused: false, lr: a.lr, sel: 150, dataset: a.dataset, hidden: a.hidden, optimizer: a.optimizer };
         let info = info_for(&a);
         let first = layout(&ctx, &mut ctl, &info);
         let r = first.sel_rect.expect("inspect slider laid out");
         let pos = egui::pos2(r.left() + 4.0, r.center().y);
         press_hold_release(&ctx, &mut ctl, &info, pos);
         assert!(ctl.sel < 20, "sample {} should jump toward the start", ctl.sel);
+    }
+
+    #[test]
+    fn real_click_on_optimizer_toggle_switches_and_resets_lr() {
+        let ctx = egui::Context::default();
+        let mut a = app(Dataset::Spiral, 8);
+        a.train(50);
+        let mut ctl = Controls { paused: false, lr: a.lr, sel: 0, dataset: a.dataset, hidden: a.hidden, optimizer: a.optimizer };
+        let info = info_for(&a);
+        let first = layout(&ctx, &mut ctl, &info);
+        let (_, rect) = *first.optimizer_rects.iter().find(|(o, _)| *o == Optimizer::Sgd).expect("SGD toggle laid out");
+        let acts = run_sidebar(&ctx, &mut ctl, &info, click_at(rect.center()));
+        assert_eq!(ctl.optimizer, Optimizer::Sgd);
+        assert_eq!(ctl.lr, Optimizer::Sgd.default_lr(), "switching optimizer must pick that optimizer's lr");
+        a.apply(&ctl, &acts);
+        assert_eq!(a.optimizer, Optimizer::Sgd);
+        assert_eq!(a.step, 0, "switching optimizer restarts training for a fair comparison");
+    }
+
+    #[test]
+    fn default_optimizer_solves_spiral_within_a_few_thousand_steps() {
+        let mut a = app(Dataset::Spiral, 8);
+        assert_eq!(a.optimizer, Optimizer::Adam);
+        a.train(3000);
+        let correct = a.data.iter().filter(|(x, y)| ((a.net.predict(x)[0] > 0.5) as i32 as f64) == *y).count();
+        assert!(correct as f64 / a.data.len() as f64 > 0.95, "only {correct} of {} correct", a.data.len());
     }
 
     /// Build the app state without a window (no EguiState needed for these checks).
