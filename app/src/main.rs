@@ -20,8 +20,12 @@ struct NnViz {
     net: Mlp,
     dataset: Dataset,
     hidden: usize,
+    depth: usize,
     optimizer: Optimizer,
     adam: AdamState,
+    acc_hist: Vec<f64>,
+    draw: bool,
+    brush: f64,
     data: Vec<(Vec<f64>, f64)>,
     lr: f64,
     steps_per_frame: usize,
@@ -37,9 +41,13 @@ struct NnViz {
     shot_at: usize,
 }
 
-fn fresh_net(hidden: usize) -> Mlp {
+/// `depth` hidden layers of `hidden` tanh neurons each: [2, hidden x depth, 1].
+fn fresh_net(hidden: usize, depth: usize) -> Mlp {
     let mut rng = Rng::new(42);
-    Mlp::new(&[2, hidden, 1], &mut rng)
+    let mut sizes = vec![2];
+    sizes.extend(std::iter::repeat(hidden).take(depth));
+    sizes.push(1);
+    Mlp::new(&sizes, &mut rng)
 }
 
 /// Blue (class 0) to orange (class 1), by network output p in [0,1].
@@ -77,9 +85,9 @@ fn env_dataset() -> Dataset {
     }
 }
 
-/// Dev override for capture runs: NN_VIZ_HIDDEN=2|4|8.
+/// Dev override for capture runs: NN_VIZ_HIDDEN=2|4|8|16.
 fn env_hidden() -> usize {
-    std::env::var("NN_VIZ_HIDDEN").ok().and_then(|s| s.parse().ok()).filter(|h| [2, 4, 8].contains(h)).unwrap_or(8)
+    std::env::var("NN_VIZ_HIDDEN").ok().and_then(|s| s.parse().ok()).filter(|h| [2, 4, 8, 16].contains(h)).unwrap_or(8)
 }
 
 /// Sidebar state the user can change. Copied in from NnViz each frame and written back after.
@@ -90,7 +98,24 @@ struct Controls {
     sel: usize,
     dataset: Dataset,
     hidden: usize,
+    depth: usize,
     optimizer: Optimizer,
+    draw: bool,
+    brush: f64,
+}
+
+fn accuracy(net: &Mlp, data: &[(Vec<f64>, f64)]) -> f64 {
+    let ok = data.iter().filter(|(x, y)| ((net.predict(x)[0] > 0.5) as i32 as f64) == *y).count();
+    ok as f64 / data.len().max(1) as f64
+}
+
+/// Inverse of the boundary plot's data-to-pixel mapping: pixel position -> (x, y) in data space.
+fn px_to_data(rect: egui::Rect, ds: Dataset, pos: egui::Pos2) -> (f64, f64) {
+    let (lo, hi) = domain(ds);
+    let span = hi - lo;
+    let x = lo + (pos.x - rect.left()) as f64 / rect.width() as f64 * span;
+    let y = lo + (rect.bottom() - pos.y) as f64 / rect.height() as f64 * span;
+    (x, y)
 }
 
 /// Read-only numbers the sidebar displays.
@@ -110,6 +135,9 @@ struct Actions {
     reset_rect: Option<egui::Rect>,
     dataset_rects: Vec<(Dataset, egui::Rect)>,
     hidden_rects: Vec<(usize, egui::Rect)>,
+    depth_rects: Vec<(usize, egui::Rect)>,
+    draw_rect: Option<egui::Rect>,
+    brush_rects: Vec<(f64, egui::Rect)>,
     optimizer_rects: Vec<(Optimizer, egui::Rect)>,
     lr_rect: Option<egui::Rect>,
     paused_rect: Option<egui::Rect>,
@@ -135,10 +163,18 @@ fn sidebar(ui: &mut egui::Ui, ctl: &mut Controls, info: &SidebarInfo) -> Actions
     });
     ui.horizontal(|ui| {
         ui.label("hidden:");
-        for h in [2usize, 4, 8] {
+        for h in [2usize, 4, 8, 16] {
             let r = ui.selectable_label(ctl.hidden == h, format!("{h}"));
             a.hidden_rects.push((h, r.rect));
             if r.clicked() { ctl.hidden = h; }
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("hidden layers:");
+        for d in [1usize, 2] {
+            let r = ui.selectable_label(ctl.depth == d, format!("{d}"));
+            a.depth_rects.push((d, r.rect));
+            if r.clicked() { ctl.depth = d; }
         }
     });
     ui.horizontal(|ui| {
@@ -150,6 +186,15 @@ fn sidebar(ui: &mut egui::Ui, ctl: &mut Controls, info: &SidebarInfo) -> Actions
                 ctl.optimizer = opt;
                 ctl.lr = opt.default_lr();
             }
+        }
+    });
+    a.draw_rect = Some(ui.checkbox(&mut ctl.draw, "draw points (left click adds, right click removes)").rect);
+    ui.horizontal(|ui| {
+        ui.label("brush:");
+        for (class, name) in [(0.0, "blue (0)"), (1.0, "orange (1)")] {
+            let r = ui.selectable_label(ctl.brush == class, name);
+            a.brush_rects.push((class, r.rect));
+            if r.clicked() { ctl.brush = class; }
         }
     });
     let step_resp = ui.button("step (x1)");
@@ -180,11 +225,15 @@ impl NnViz {
         NnViz {
             shot_path: std::env::var("NN_VIZ_SHOT").ok(),
             shot_at: std::env::var("NN_VIZ_SHOT_AT").ok().and_then(|s| s.parse().ok()).unwrap_or(2000),
-            net: fresh_net(env_hidden()),
+            net: fresh_net(env_hidden(), 1),
             dataset: env_dataset(),
             hidden: env_hidden(),
+            depth: 1,
             optimizer: Optimizer::Adam,
-            adam: AdamState::new(&fresh_net(env_hidden())),
+            adam: AdamState::new(&fresh_net(env_hidden(), 1)),
+            acc_hist: Vec::new(),
+            draw: false,
+            brush: 1.0,
             data: env_dataset().points(DATA_SEED, PER_CLASS),
             lr: Optimizer::Adam.default_lr(),
             steps_per_frame: 20,
@@ -202,10 +251,11 @@ impl NnViz {
     /// Applies one frame's clicks and control changes. Order matches the pre-refactor code:
     /// rebuild on dataset/hidden change, then reset, then a single manual step.
     fn apply(&mut self, ctl: &Controls, a: &Actions) {
-        let arch_changed = ctl.hidden != self.hidden || ctl.dataset != self.dataset || ctl.optimizer != self.optimizer;
+        let arch_changed = ctl.hidden != self.hidden || ctl.dataset != self.dataset || ctl.optimizer != self.optimizer || ctl.depth != self.depth;
         self.dataset = ctl.dataset;
         self.hidden = ctl.hidden;
         self.optimizer = ctl.optimizer;
+        self.depth = ctl.depth;
         if arch_changed {
             self.rebuild();
         }
@@ -218,11 +268,28 @@ impl NnViz {
         }
     }
 
+    /// Adds a labelled point; training continues on the enlarged set with the current weights.
+    fn add_point(&mut self, x: f64, y: f64, class: f64) {
+        self.data.push((vec![x, y], class));
+    }
+
+    /// Removes the point nearest (x, y). Always keeps at least one point so the UI never has empty data.
+    fn remove_nearest(&mut self, x: f64, y: f64) {
+        if self.data.len() <= 1 { return; }
+        let d2 = |p: &Vec<f64>| (p[0] - x).powi(2) + (p[1] - y).powi(2);
+        let idx = (0..self.data.len())
+            .min_by(|&a, &b| d2(&self.data[a].0).partial_cmp(&d2(&self.data[b].0)).unwrap())
+            .unwrap();
+        self.data.remove(idx);
+        self.sel = self.sel.min(self.data.len() - 1);
+    }
+
     fn reset(&mut self) {
-        self.net = fresh_net(self.hidden);
+        self.net = fresh_net(self.hidden, self.depth);
         self.adam = AdamState::new(&self.net);
         self.step = 0;
         self.loss_hist.clear();
+        self.acc_hist.clear();
         self.loss = f64::NAN;
         self.grid_step = usize::MAX;
     }
@@ -230,11 +297,12 @@ impl NnViz {
     /// Switching dataset or architecture rebuilds everything, so no stale weights survive.
     fn rebuild(&mut self) {
         self.data = self.dataset.points(DATA_SEED, PER_CLASS);
-        self.net = fresh_net(self.hidden);
+        self.net = fresh_net(self.hidden, self.depth);
         self.adam = AdamState::new(&self.net);
         self.sel = 0;
         self.step = 0;
         self.loss_hist.clear();
+        self.acc_hist.clear();
         self.loss = f64::NAN;
         self.grid_step = usize::MAX;
     }
@@ -248,6 +316,7 @@ impl NnViz {
             self.step += 1;
             if self.step % 10 == 0 {
                 self.loss_hist.push(self.loss);
+                self.acc_hist.push(accuracy(&self.net, &self.data));
             }
         }
     }
@@ -304,9 +373,15 @@ impl Game for NnViz {
             sel: self.sel,
             dataset: self.dataset,
             hidden: self.hidden,
+            depth: self.depth,
             optimizer: self.optimizer,
+            draw: self.draw,
+            brush: self.brush,
         };
         let hist = self.loss_hist.clone();
+        let acc_hist = self.acc_hist.clone();
+        let mut plot_click: Option<(egui::Pos2, bool)> = None;
+        let mut plot_rect = egui::Rect::NOTHING;
         let grid = self.grid.clone();
         let net = self.net.clone();
         let data = self.data.clone();
@@ -325,8 +400,9 @@ impl Game for NnViz {
             });
 
             egui::CentralPanel::default().show(egui_ctx, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.label("network (inspected sample; green = +weight, red = -weight; node brightness = |activation|)");
-                let (net_rect, _) = ui.allocate_exact_size(egui::vec2(560.0, 310.0), egui::Sense::hover());
+                let (net_rect, _) = ui.allocate_exact_size(egui::vec2(560.0, 260.0), egui::Sense::hover());
                 let painter = ui.painter_at(net_rect);
                 // Inset so the bottom node and its value label stay inside the clip rect.
                 let inner = net_rect.shrink2(egui::vec2(0.0, 34.0));
@@ -367,7 +443,14 @@ impl Game for NnViz {
 
                 ui.add_space(8.0);
                 ui.label("decision boundary (background = network output; dots = training data, ring = inspected)");
-                let (bd_rect, _) = ui.allocate_exact_size(egui::vec2(260.0, 260.0), egui::Sense::hover());
+                let (bd_rect, bd_resp) = ui.allocate_exact_size(egui::vec2(260.0, 260.0), egui::Sense::click());
+                plot_rect = bd_rect;
+                if ctl.draw {
+                    if let Some(pos) = bd_resp.interact_pointer_pos() {
+                        if bd_resp.clicked() { plot_click = Some((pos, true)); }
+                        else if bd_resp.secondary_clicked() { plot_click = Some((pos, false)); }
+                    }
+                }
                 let bp = ui.painter_at(bd_rect);
                 let cell = bd_rect.width() / GRID as f32;
                 for gy in 0..GRID {
@@ -401,7 +484,7 @@ impl Game for NnViz {
                 ui.add_space(8.0);
                 ui.label("loss history (log10 scale)");
                 let (lo, hi) = log_range(&hist);
-                let (lr_rect, _) = ui.allocate_exact_size(egui::vec2(560.0, 140.0), egui::Sense::hover());
+                let (lr_rect, _) = ui.allocate_exact_size(egui::vec2(560.0, 110.0), egui::Sense::hover());
                 let lp = ui.painter_at(lr_rect);
                 lp.rect_stroke(lr_rect, 0.0, egui::Stroke::new(1.0_f32, egui::Color32::DARK_GRAY));
                 lp.text(lr_rect.left_top() + egui::vec2(4.0, 2.0), egui::Align2::LEFT_TOP,
@@ -417,6 +500,24 @@ impl Game for NnViz {
                     }).collect();
                     lp.add(egui::Shape::line(pts, egui::Stroke::new(1.5_f32, egui::Color32::LIGHT_GREEN)));
                 }
+
+                ui.add_space(8.0);
+                ui.label("accuracy history (0% to 100%)");
+                let (ac_rect, _) = ui.allocate_exact_size(egui::vec2(560.0, 80.0), egui::Sense::hover());
+                let ap = ui.painter_at(ac_rect);
+                ap.rect_stroke(ac_rect, 0.0, egui::Stroke::new(1.0_f32, egui::Color32::DARK_GRAY));
+                let half = ac_rect.bottom() - 0.5 * ac_rect.height();
+                ap.line_segment([egui::pos2(ac_rect.left(), half), egui::pos2(ac_rect.right(), half)], egui::Stroke::new(0.5_f32, egui::Color32::DARK_GRAY));
+                ap.text(ac_rect.left_top() + egui::vec2(4.0, 2.0), egui::Align2::LEFT_TOP, "100%", egui::FontId::proportional(11.0), egui::Color32::GRAY);
+                ap.text(ac_rect.left_bottom() + egui::vec2(4.0, -2.0), egui::Align2::LEFT_BOTTOM, "0%", egui::FontId::proportional(11.0), egui::Color32::GRAY);
+                if acc_hist.len() > 1 {
+                    let pts: Vec<egui::Pos2> = acc_hist.iter().enumerate().map(|(i, v)| {
+                        let fx = i as f32 / (acc_hist.len() - 1) as f32;
+                        egui::pos2(ac_rect.left() + fx * ac_rect.width(), ac_rect.bottom() - *v as f32 * ac_rect.height())
+                    }).collect();
+                    ap.add(egui::Shape::line(pts, egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(240, 180, 60))));
+                }
+            });
             });
         });
         ui.paint(size, output);
@@ -424,6 +525,12 @@ impl Game for NnViz {
         self.paused = ctl.paused;
         self.lr = ctl.lr;
         self.sel = ctl.sel;
+        self.draw = ctl.draw;
+        self.brush = ctl.brush;
+        if let Some((pos, add)) = plot_click {
+            let (x, y) = px_to_data(plot_rect, self.dataset, pos);
+            if add { self.add_point(x, y, self.brush); } else { self.remove_nearest(x, y); }
+        }
         self.apply(&ctl, &actions);
 
         if let Some(path) = self.shot_path.clone() {
@@ -503,7 +610,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut a = app(Dataset::Circles, 4);
         a.train(30);
-        let mut ctl = Controls { paused: false, lr: a.lr, sel: 0, dataset: a.dataset, hidden: a.hidden, optimizer: a.optimizer };
+        let mut ctl = Controls { paused: false, lr: a.lr, sel: 0, dataset: a.dataset, hidden: a.hidden, depth: a.depth, optimizer: a.optimizer, draw: a.draw, brush: a.brush };
         let info = info_for(&a);
         let first = layout(&ctx, &mut ctl, &info);
         let pos = first.reset_rect.expect("reset button laid out").center();
@@ -520,7 +627,7 @@ mod tests {
     fn real_click_on_step_advances_one_iteration() {
         let ctx = egui::Context::default();
         let mut a = app(Dataset::Xor, 4);
-        let mut ctl = Controls { paused: true, lr: a.lr, sel: 0, dataset: a.dataset, hidden: a.hidden, optimizer: a.optimizer };
+        let mut ctl = Controls { paused: true, lr: a.lr, sel: 0, dataset: a.dataset, hidden: a.hidden, depth: a.depth, optimizer: a.optimizer, draw: a.draw, brush: a.brush };
         let info = info_for(&a);
         let first = layout(&ctx, &mut ctl, &info);
         let pos = first.step_rect.expect("step button laid out").center();
@@ -534,7 +641,7 @@ mod tests {
     fn real_click_on_dataset_toggle_rebuilds() {
         let ctx = egui::Context::default();
         let mut a = app(Dataset::Xor, 4);
-        let mut ctl = Controls { paused: false, lr: a.lr, sel: 0, dataset: a.dataset, hidden: a.hidden, optimizer: a.optimizer };
+        let mut ctl = Controls { paused: false, lr: a.lr, sel: 0, dataset: a.dataset, hidden: a.hidden, depth: a.depth, optimizer: a.optimizer, draw: a.draw, brush: a.brush };
         let info = info_for(&a);
         let first = layout(&ctx, &mut ctl, &info);
         let (_, rect) = *first.dataset_rects.iter().find(|(d, _)| *d == Dataset::Spiral).expect("spiral toggle laid out");
@@ -549,7 +656,7 @@ mod tests {
     fn real_click_on_hidden_toggle_rebuilds_network() {
         let ctx = egui::Context::default();
         let mut a = app(Dataset::Circles, 4);
-        let mut ctl = Controls { paused: false, lr: a.lr, sel: 0, dataset: a.dataset, hidden: a.hidden, optimizer: a.optimizer };
+        let mut ctl = Controls { paused: false, lr: a.lr, sel: 0, dataset: a.dataset, hidden: a.hidden, depth: a.depth, optimizer: a.optimizer, draw: a.draw, brush: a.brush };
         let info = info_for(&a);
         let first = layout(&ctx, &mut ctl, &info);
         let (_, rect) = *first.hidden_rects.iter().find(|(h, _)| *h == 8).expect("hidden=8 toggle laid out");
@@ -565,7 +672,7 @@ mod tests {
     fn real_click_on_paused_checkbox_toggles_it() {
         let ctx = egui::Context::default();
         let a = app(Dataset::Xor, 4);
-        let mut ctl = Controls { paused: false, lr: a.lr, sel: 0, dataset: a.dataset, hidden: a.hidden, optimizer: a.optimizer };
+        let mut ctl = Controls { paused: false, lr: a.lr, sel: 0, dataset: a.dataset, hidden: a.hidden, depth: a.depth, optimizer: a.optimizer, draw: a.draw, brush: a.brush };
         let info = info_for(&a);
         let first = layout(&ctx, &mut ctl, &info);
         let pos = first.paused_rect.expect("paused checkbox laid out").center();
@@ -577,7 +684,7 @@ mod tests {
     fn real_click_on_lr_slider_changes_learning_rate() {
         let ctx = egui::Context::default();
         let a = app(Dataset::Xor, 4);
-        let mut ctl = Controls { paused: false, lr: a.lr, sel: 0, dataset: a.dataset, hidden: a.hidden, optimizer: a.optimizer };
+        let mut ctl = Controls { paused: false, lr: a.lr, sel: 0, dataset: a.dataset, hidden: a.hidden, depth: a.depth, optimizer: a.optimizer, draw: a.draw, brush: a.brush };
         let before = ctl.lr;
         let info = info_for(&a);
         let first = layout(&ctx, &mut ctl, &info);
@@ -594,7 +701,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut a = app(Dataset::Circles, 4);
         a.train(10);
-        let mut ctl = Controls { paused: false, lr: a.lr, sel: 150, dataset: a.dataset, hidden: a.hidden, optimizer: a.optimizer };
+        let mut ctl = Controls { paused: false, lr: a.lr, sel: 150, dataset: a.dataset, hidden: a.hidden, depth: a.depth, optimizer: a.optimizer, draw: a.draw, brush: a.brush };
         let info = info_for(&a);
         let first = layout(&ctx, &mut ctl, &info);
         let r = first.sel_rect.expect("inspect slider laid out");
@@ -608,7 +715,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut a = app(Dataset::Spiral, 8);
         a.train(50);
-        let mut ctl = Controls { paused: false, lr: a.lr, sel: 0, dataset: a.dataset, hidden: a.hidden, optimizer: a.optimizer };
+        let mut ctl = Controls { paused: false, lr: a.lr, sel: 0, dataset: a.dataset, hidden: a.hidden, depth: a.depth, optimizer: a.optimizer, draw: a.draw, brush: a.brush };
         let info = info_for(&a);
         let first = layout(&ctx, &mut ctl, &info);
         let (_, rect) = *first.optimizer_rects.iter().find(|(o, _)| *o == Optimizer::Sgd).expect("SGD toggle laid out");
@@ -627,6 +734,91 @@ mod tests {
         a.train(3000);
         let correct = a.data.iter().filter(|(x, y)| ((a.net.predict(x)[0] > 0.5) as i32 as f64) == *y).count();
         assert!(correct as f64 / a.data.len() as f64 > 0.95, "only {correct} of {} correct", a.data.len());
+    }
+
+    #[test]
+    fn real_click_on_depth_toggle_builds_two_hidden_layers() {
+        let ctx = egui::Context::default();
+        let mut a = app(Dataset::Spiral, 4);
+        let mut ctl = Controls { paused: false, lr: a.lr, sel: 0, dataset: a.dataset, hidden: a.hidden, depth: a.depth, optimizer: a.optimizer, draw: a.draw, brush: a.brush };
+        let info = info_for(&a);
+        let first = layout(&ctx, &mut ctl, &info);
+        let (_, rect) = *first.depth_rects.iter().find(|(d, _)| *d == 2).expect("depth=2 toggle laid out");
+        let acts = run_sidebar(&ctx, &mut ctl, &info, click_at(rect.center()));
+        a.apply(&ctl, &acts);
+        assert_eq!(a.net.layers.len(), 3, "two hidden layers plus output");
+        assert_eq!(a.net.layers[1].n_in, 4);
+        assert_eq!(a.net.layers[1].n_out, 4);
+    }
+
+    #[test]
+    fn hidden_16_is_offered_and_builds() {
+        let ctx = egui::Context::default();
+        let mut a = app(Dataset::Circles, 4);
+        let mut ctl = Controls { paused: false, lr: a.lr, sel: 0, dataset: a.dataset, hidden: a.hidden, depth: a.depth, optimizer: a.optimizer, draw: a.draw, brush: a.brush };
+        let info = info_for(&a);
+        let first = layout(&ctx, &mut ctl, &info);
+        let (_, rect) = *first.hidden_rects.iter().find(|(h, _)| *h == 16).expect("hidden=16 toggle laid out");
+        let acts = run_sidebar(&ctx, &mut ctl, &info, click_at(rect.center()));
+        a.apply(&ctl, &acts);
+        assert_eq!(a.net.layers[0].n_out, 16);
+    }
+
+    #[test]
+    fn accuracy_history_is_recorded_alongside_loss() {
+        let mut a = app(Dataset::Circles, 4);
+        a.train(100);
+        assert_eq!(a.acc_hist.len(), a.loss_hist.len());
+        assert_eq!(a.acc_hist.len(), 10);
+        assert!(a.acc_hist.iter().all(|v| (0.0..=1.0).contains(v)));
+        a.reset();
+        assert!(a.acc_hist.is_empty(), "reset must clear the accuracy curve");
+    }
+
+    #[test]
+    fn plot_pixel_mapping_round_trips() {
+        let rect = egui::Rect::from_min_size(egui::pos2(100.0, 50.0), egui::vec2(260.0, 260.0));
+        // Centre of the plot is the centre of the domain.
+        for ds in [Dataset::Xor, Dataset::Circles, Dataset::Spiral] {
+            let (lo, hi) = domain(ds);
+            let (x, y) = px_to_data(rect, ds, rect.center());
+            assert!((x - (lo + hi) / 2.0).abs() < 1e-6 && (y - (lo + hi) / 2.0).abs() < 1e-6);
+            // Top-left pixel is (lo, hi): y grows upward on screen.
+            let (x, y) = px_to_data(rect, ds, rect.left_top());
+            assert!((x - lo).abs() < 1e-6 && (y - hi).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn drawing_adds_and_removes_points_and_keeps_weights() {
+        let mut a = app(Dataset::Circles, 4);
+        a.train(20);
+        let w_before = a.net.layers[0].w.clone();
+        let n = a.data.len();
+        a.add_point(0.1, 0.2, 1.0);
+        assert_eq!(a.data.len(), n + 1);
+        assert_eq!(a.data.last().unwrap(), &(vec![0.1, 0.2], 1.0));
+        assert_eq!(a.net.layers[0].w, w_before, "adding a point must not touch the weights");
+        a.remove_nearest(0.1, 0.2);
+        assert_eq!(a.data.len(), n, "the nearest point is the one just added");
+        // Never empties the dataset.
+        a.data.truncate(1);
+        a.remove_nearest(0.0, 0.0);
+        assert_eq!(a.data.len(), 1);
+    }
+
+    #[test]
+    fn draw_checkbox_and_brush_clicks_reach_controls() {
+        let ctx = egui::Context::default();
+        let a = app(Dataset::Xor, 4);
+        let mut ctl = Controls { paused: false, lr: a.lr, sel: 0, dataset: a.dataset, hidden: a.hidden, depth: a.depth, optimizer: a.optimizer, draw: a.draw, brush: a.brush };
+        let info = info_for(&a);
+        let first = layout(&ctx, &mut ctl, &info);
+        run_sidebar(&ctx, &mut ctl, &info, click_at(first.draw_rect.unwrap().left_center() + egui::vec2(8.0, 0.0)));
+        assert!(ctl.draw);
+        let (_, rect) = *first.brush_rects.iter().find(|(c, _)| *c == 0.0).unwrap();
+        run_sidebar(&ctx, &mut ctl, &info, click_at(rect.center()));
+        assert_eq!(ctl.brush, 0.0);
     }
 
     /// Build the app state without a window (no EguiState needed for these checks).
