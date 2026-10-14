@@ -7,7 +7,7 @@ A small neural-network trainer with a live visualizer. Trains an MLP on XOR, cir
 - `app/` (`nn_viz`): the window and UI, built on the Jame engine (`engine` crate) with egui 0.29.
 
 ## Build and run
-The app depends on the Jame engine by local path, `C:/Users/james/jame-engine/engine` (see `app/Cargo.toml`). Clone that checkout first or change the path.
+The app depends on the Jame engine as a git dependency pinned to a revision (see `app/Cargo.toml`), so no local checkout is needed. To develop against a local engine, temporarily point `engine` at a path.
 
 ```
 cargo test                 # core + app tests
@@ -24,4 +24,4 @@ Dev overrides for capture runs:
 - The `.cargo/config.toml` `[env]` block is needed on Windows to build vendored SDL2 with a recent CMake.
 
 ## Status
-Phases 0–4 done: core math, window and egui shell, visualizer, dataset and hidden-size controls. Click tests cover reset, step, and the dataset and hidden toggles. Slider and checkbox clicks are not yet tested.
+Phases 0–4 done: core math, window and egui shell, visualizer, dataset and hidden-size controls. Click tests cover reset, step, the dataset and hidden toggles, the paused checkbox, and both sliders.

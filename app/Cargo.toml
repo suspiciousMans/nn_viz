@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-engine = { path = "C:/Users/james/jame-engine/engine" }
+engine = { git = "https://github.com/suspiciousMans/jame-engine", rev = "a87bbcf" }
 nn_core = { path = "../core" }
 glam = "0.26"
 log = "0.4"

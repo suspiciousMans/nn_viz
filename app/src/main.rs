@@ -107,6 +107,9 @@ struct Actions {
     reset_rect: Option<egui::Rect>,
     dataset_rects: Vec<(Dataset, egui::Rect)>,
     hidden_rects: Vec<(usize, egui::Rect)>,
+    lr_rect: Option<egui::Rect>,
+    paused_rect: Option<egui::Rect>,
+    sel_rect: Option<egui::Rect>,
 }
 
 /// The left panel. Pure with respect to NnViz: it only reads `info` and edits `ctl`,
@@ -116,8 +119,8 @@ fn sidebar(ui: &mut egui::Ui, ctl: &mut Controls, info: &SidebarInfo) -> Actions
     ui.heading(format!("nn_viz — {}", ctl.dataset.name()));
     ui.label(format!("step {}", info.step));
     ui.label(format!("loss {:.6}", info.loss));
-    ui.add(egui::Slider::new(&mut ctl.lr, 0.01..=2.0).text("learning rate"));
-    ui.checkbox(&mut ctl.paused, "paused");
+    a.lr_rect = Some(ui.add(egui::Slider::new(&mut ctl.lr, 0.01..=2.0).text("learning rate")).rect);
+    a.paused_rect = Some(ui.checkbox(&mut ctl.paused, "paused").rect);
     ui.horizontal(|ui| {
         ui.label("dataset:");
         for ds in [Dataset::Xor, Dataset::Circles, Dataset::Spiral] {
@@ -142,7 +145,7 @@ fn sidebar(ui: &mut egui::Ui, ctl: &mut Controls, info: &SidebarInfo) -> Actions
     a.reset = reset_resp.clicked();
     ui.separator();
     let n = info.preds.len().max(1);
-    ui.add(egui::Slider::new(&mut ctl.sel, 0..=n - 1).text("inspect sample"));
+    a.sel_rect = Some(ui.add(egui::Slider::new(&mut ctl.sel, 0..=n - 1).text("inspect sample")).rect);
     ui.separator();
     if info.preds.len() <= 8 {
         for (x, y, p) in &info.preds {
@@ -457,6 +460,15 @@ mod tests {
         run_sidebar(ctx, ctl, info, vec![])
     }
 
+    /// Sliders react to a held pointer, not a same-frame click, so press, hold, then release over several frames.
+    fn press_hold_release(ctx: &egui::Context, ctl: &mut Controls, info: &SidebarInfo, pos: egui::Pos2) {
+        let btn = |pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        run_sidebar(ctx, ctl, info, vec![egui::Event::PointerMoved(pos)]);
+        run_sidebar(ctx, ctl, info, vec![btn(true)]);
+        run_sidebar(ctx, ctl, info, vec![egui::Event::PointerMoved(pos + egui::vec2(1.0, 0.0))]);
+        run_sidebar(ctx, ctl, info, vec![btn(false)]);
+    }
+
     fn info_for(a: &NnViz) -> SidebarInfo {
         let preds: Vec<(Vec<f64>, f64, f64)> = a.data.iter().map(|(x, y)| (x.clone(), *y, a.net.predict(x)[0])).collect();
         SidebarInfo { step: a.step, loss: a.loss, preds }
@@ -524,6 +536,48 @@ mod tests {
         assert_eq!(a.net.layers[1].n_in, 8);
     }
 
+
+    #[test]
+    fn real_click_on_paused_checkbox_toggles_it() {
+        let ctx = egui::Context::default();
+        let a = app(Dataset::Xor, 4);
+        let mut ctl = Controls { paused: false, lr: a.lr, sel: 0, dataset: a.dataset, hidden: a.hidden };
+        let info = info_for(&a);
+        let first = layout(&ctx, &mut ctl, &info);
+        let pos = first.paused_rect.expect("paused checkbox laid out").center();
+        run_sidebar(&ctx, &mut ctl, &info, click_at(pos));
+        assert!(ctl.paused, "a click on the checkbox must pause");
+    }
+
+    #[test]
+    fn real_click_on_lr_slider_changes_learning_rate() {
+        let ctx = egui::Context::default();
+        let a = app(Dataset::Xor, 4);
+        let mut ctl = Controls { paused: false, lr: a.lr, sel: 0, dataset: a.dataset, hidden: a.hidden };
+        let before = ctl.lr;
+        let info = info_for(&a);
+        let first = layout(&ctx, &mut ctl, &info);
+        // The left end of the rail is the minimum, so clicking just inside it must lower lr.
+        let r = first.lr_rect.expect("lr slider laid out");
+        let pos = egui::pos2(r.left() + 4.0, r.center().y);
+        press_hold_release(&ctx, &mut ctl, &info, pos);
+        assert!(ctl.lr < before * 0.5, "lr {} should drop well below {}", ctl.lr, before);
+        assert!(ctl.lr >= 0.01);
+    }
+
+    #[test]
+    fn real_click_on_inspect_slider_moves_the_selection() {
+        let ctx = egui::Context::default();
+        let mut a = app(Dataset::Circles, 4);
+        a.train(10);
+        let mut ctl = Controls { paused: false, lr: a.lr, sel: 150, dataset: a.dataset, hidden: a.hidden };
+        let info = info_for(&a);
+        let first = layout(&ctx, &mut ctl, &info);
+        let r = first.sel_rect.expect("inspect slider laid out");
+        let pos = egui::pos2(r.left() + 4.0, r.center().y);
+        press_hold_release(&ctx, &mut ctl, &info, pos);
+        assert!(ctl.sel < 20, "sample {} should jump toward the start", ctl.sel);
+    }
 
     /// Build the app state without a window (no EguiState needed for these checks).
     fn app(ds: Dataset, hidden: usize) -> NnViz {

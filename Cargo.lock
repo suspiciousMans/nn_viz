@@ -420,13 +420,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "duplicate"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e92f10a49176cbffacaedabfaa11d51db1ea0f80a83c26e1873b43cd1742c24"
+dependencies = [
+ "heck",
+ "proc-macro2",
+ "proc-macro2-diagnostics",
+]
+
+[[package]]
 name = "ecolor"
 version = "0.29.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "775cfde491852059e386c4e1deb4aef381c617dc364184c6f6afee99b87c402b"
 dependencies = [
  "bytemuck",
- "emath",
+ "emath 0.29.1",
+]
+
+[[package]]
+name = "ecolor"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d72e9c39f6e11a2e922d04a34ec5e7ef522ea3f5a1acfca7a19d16ad5fe50f5"
+dependencies = [
+ "emath 0.30.0",
 ]
 
 [[package]]
@@ -436,9 +456,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "53eafabcce0cb2325a59a98736efe0bf060585b437763f8c476957fb274bb974"
 dependencies = [
  "ahash",
- "emath",
- "epaint",
+ "emath 0.29.1",
+ "epaint 0.29.1",
  "nohash-hasher",
+]
+
+[[package]]
+name = "egui"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "252d52224d35be1535d7fd1d6139ce071fb42c9097773e79f7665604f5596b5e"
+dependencies = [
+ "ahash",
+ "emath 0.30.0",
+ "epaint 0.30.0",
+ "nohash-hasher",
+ "profiling",
+]
+
+[[package]]
+name = "egui_dock"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4a2e6e4f8bc019bcd7cee5240c6c76a9eed421b364307739561c92acc4cc0f22"
+dependencies = [
+ "duplicate",
+ "egui 0.30.0",
+ "paste",
 ]
 
 [[package]]
@@ -449,7 +493,7 @@ checksum = "0e39bccc683cd43adab530d8f21a13eb91e80de10bcc38c3f1c16601b6f62b26"
 dependencies = [
  "ahash",
  "bytemuck",
- "egui",
+ "egui 0.29.1",
  "glow",
  "log",
  "memoffset",
@@ -473,6 +517,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "emath"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4fe73c1207b864ee40aa0b0c038d6092af1030744678c60188a05c28553515d"
+
+[[package]]
 name = "encoding_rs"
 version = "0.8.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -489,11 +539,13 @@ dependencies = [
 [[package]]
 name = "engine"
 version = "0.1.0"
+source = "git+https://github.com/suspiciousMans/jame-engine?rev=a87bbcf#a87bbcfe03b9d23bace7ab3e5be2ca5690faf7b0"
 dependencies = [
  "anyhow",
  "bincode",
  "bytemuck",
- "egui",
+ "egui 0.29.1",
+ "egui_dock",
  "egui_glow",
  "glam 0.29.3",
  "glow",
@@ -542,11 +594,26 @@ dependencies = [
  "ab_glyph",
  "ahash",
  "bytemuck",
- "ecolor",
- "emath",
+ "ecolor 0.29.1",
+ "emath 0.29.1",
  "epaint_default_fonts",
  "nohash-hasher",
  "parking_lot",
+]
+
+[[package]]
+name = "epaint"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5666f8d25236293c966fbb3635eac18b04ad1914e3bab55bc7d44b9980cafcac"
+dependencies = [
+ "ab_glyph",
+ "ahash",
+ "ecolor 0.30.0",
+ "emath 0.30.0",
+ "nohash-hasher",
+ "parking_lot",
+ "profiling",
 ]
 
 [[package]]
@@ -745,6 +812,12 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+
+[[package]]
+name = "heck"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hecs"
@@ -1256,6 +1329,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "paste"
+version = "1.0.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
+
+[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1312,6 +1391,24 @@ checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
 ]
+
+[[package]]
+name = "proc-macro2-diagnostics"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af066a9c399a26e020ada66a034357a868728e72cd426f3adcd35f80d88d88c8"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+ "version_check",
+]
+
+[[package]]
+name = "profiling"
+version = "1.0.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
 
 [[package]]
 name = "pxfm"
